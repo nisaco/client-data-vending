@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataLink - Reseller</title>
+    <!-- Load React, ReactDOM, and Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Load Paystack SDK -->
+    <script src="https://js.paystack.co/v1/inline.js"></script>
+    <!-- Load Tailwind CSS and Inter Font -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 transition-colors duration-300">
+    <div id="root"></div>
+
+    <!-- Mount the React Application -->
+    <!-- The JSX file MUST be loaded using type="text/babel" -->
+    <script type="text/babel" src="/DataResellerApp.jsx"></script>
+    
+    <script type="text/babel">
+        // Basic React Root Mounting
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
