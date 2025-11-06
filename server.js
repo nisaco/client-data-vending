@@ -292,6 +292,14 @@ const isDbReady = (req, res, next) => {
 
 // Authentication Middleware: Redirects unauthenticated users to the login page
 const isAuthenticated = (req, res, next) => req.session.user ? next() : res.redirect('/login.html');
+// --- ADD THIS SIMPLE HEALTH CHECK ENDPOINT ---
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
+// ---------------------------------------------
+
+// The rest of your routes follow...
+
 
 // --- USER AUTHENTICATION & INFO ROUTES ---
 app.post('/api/signup', isDbReady, async (req, res) => {
@@ -510,4 +518,5 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('Database connection is initializing...');
     
     cron.schedule('*/5 * * * *', runPendingOrderCheck); 
+
 });
