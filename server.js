@@ -8,20 +8,20 @@ const sgMail = require('@sendgrid/mail');
 const axios = require('axios');
 const cron = require('node-cron');
 const crypto = require('crypto');
+// 🛑 IMPORT FOR SESSION PERSISTENCE 🛑
+const MongoStore = require('connect-mongo');
+// Assuming database.js contains User, Order, and mongoose exports
 const { User, Order, mongoose } = require('./database.js'); 
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// 🛑 NEW API BASE URL (CKAPI) 🛑
-const RESELLER_API_BASE_URL = 'https://console.ckgodsway.com/api'; 
-const DATA_PURCHASE_ENDPOINT = '/external/data-purchase';
-const STATUS_CHECK_ENDPOINT = '/external/order-status';
+// 🛑 DATAPACKS.SHOP API BASE URL 🛑
+const RESELLER_API_BASE_URL = 'https://datapacks.shop/api.php'; 
 
 // --- 2. DATA (PLANS) AND MAPS ---
-// Prices are still the WHOLESALE COST (in PESEWAS)
 const allPlans = {
-    // CKAPI Network Key: YELLO
+    // PRICES ARE THE WHOLESALE COST (in PESEWAS)
     "MTN": [
         { id: '1', name: '1GB', price: 480 }, { id: '2', name: '2GB', price: 960 }, { id: '3', name: '3GB', price: 1420 }, 
         { id: '4', name: '4GB', price: 2000 }, { id: '5', name: '5GB', price: 2400 }, { id: '6', name: '6GB', price: 2800 }, 
@@ -29,7 +29,6 @@ const allPlans = {
         { id: '20', name: '20GB', price: 8200 }, { id: '25', name: '25GB', price: 10200 }, { id: '30', name: '30GB', price: 12200 },
         { id: '40', name: '40GB', price: 16200 }, { id: '50', name: '50GB', price: 19800 }
     ],
-    // CKAPI Network Key: AT_PREMIUM
     "AirtelTigo": [
         { id: '1', name: '1GB', price: 400 }, { id: '2', name: '2GB', price: 800 }, { id: '3', name: '3GB', price: 1200 },  
         { id: '4', name: '4GB', price: 1600 }, { id: '5', name: '5GB', price: 2000 }, { id: '6', name: '6GB', price: 2400 },  
@@ -37,7 +36,6 @@ const allPlans = {
         { id: '10', name: '10GB', price: 4200 }, { id: '12', name: '12GB', price: 5000 }, { id: '15', name: '15GB', price: 6130 },
         { id: '20', name: '20GB', price: 8210 }
     ],
-    // CKAPI Network Key: TELECEL
     "Telecel": [
         { id: '5', name: '5GB', price: 2300 }, { id: '10', name: '10GB', price: 4300 }, { id: '15', name: '15GB', price: 6220 }, 
         { id: '20', name: '20GB', price: 8300 }, { id: '25', name: '25GB', price: 10300 }, { id: '30', name: '30GB', price: 12300 },
@@ -45,16 +43,14 @@ const allPlans = {
     ]
 };
 
-// MAPPING: Frontend Display Name -> CKAPI Network Key
 const NETWORK_KEY_MAP = {
-    "MTN": 'YELLO', 
-    "AirtelTigo": 'AT_PREMIUM', 
-    "Telecel": 'TELECEL',
+    "MTN": 'MTN', 
+    "AirtelTigo": 'AT', 
+    "Telecel": 'VOD', 
 };
 
-const AGENT_REGISTRATION_FEE_PESEWAS = 2000; // GHS 20.00
-const TOPUP_FEE_RATE = 0.02; // 2% fixed fee for customer top-ups
-
+const AGENT_REGISTRATION_FEE_PESEWAS = 2000;
+const TOPUP_FEE_RATE = 0.02;
 
 // --- HELPER FUNCTIONS ---
 function findBaseCost(network, capacityId) {
@@ -72,6 +68,7 @@ function calculatePaystackFee(chargedAmountInPesewas) {
 }
 
 function calculateClientTopupFee(netDepositPesewas) {
+    // 🛑 Client pays Net Deposit + 2% Fee (used for Paystack charge calculation)
     const feeAmount = netDepositPesewas * TOPUP_FEE_RATE;
     const finalCharge = netDepositPesewas + feeAmount;
     return Math.ceil(finalCharge); 
@@ -89,7 +86,7 @@ async function sendAdminAlertEmail(order) {
         subject: `🚨 MANUAL REVIEW REQUIRED: ${order.network || 'N/A'} Data Transfer Failed`,
         html: `
             <h1>Urgent Action Required!</h1>
-            <p>A customer payment was successful, but the data bundle transfer failed automatically. Please fulfill this order manually through the Admin Dashboard.</p>
+            <p>A customer payment was successful, but the data bundle transfer failed automatically. Please fulfill this order manually through the Datapacks.shop dashboard.</p>
             <hr>
             <p><strong>Status:</strong> PENDING REVIEW</p>
             <p><strong>Network:</strong> ${order.network || 'N/A'}</p>
@@ -97,7 +94,7 @@ async function sendAdminAlertEmail(order) {
             <p><strong>Phone:</strong> ${order.phoneNumber || 'N/A'}</p>
             <p><strong>Amount Paid:</strong> GHS ${order.amount ? order.amount.toFixed(2) : 'N/A'}</p>
             <p><strong>Reference:</strong> ${order.reference || 'N/A'}</p>
-            <p><strong>Action:</strong> Check Order Reference in CKAPI Dashboard and update status if necessary.</p>
+            <p><strong>Action:</strong> Go to the Admin Dashboard and click 'Mark Sent' after fulfilling manually.</p>
         `,
     };
     try {
@@ -108,62 +105,63 @@ async function sendAdminAlertEmail(order) {
     }
 }
 
-// 🛑 CKAPI LOGIC FOR DATA PURCHASE 🛑
 async function executeDataPurchase(userId, orderDetails, paymentMethod) {
     const { network, dataPlan, amount } = orderDetails;
     
     let finalStatus = 'payment_success'; 
+    // 🛑 Use crypto for guaranteed unique reference ID
     const uniqueId = crypto.randomBytes(16).toString('hex');
     const reference = `${paymentMethod.toUpperCase()}-${uniqueId}`;
 
     // --- STEP 1: SETUP & VALIDATION ---
-    const resellerApiUrl = RESELLER_API_BASE_URL + DATA_PURCHASE_ENDPOINT;
+    const resellerApiUrl = RESELLER_API_BASE_URL;
     const networkKey = NETWORK_KEY_MAP[network]; 
-    const apiToken = process.env.CKAPI_API_KEY; 
+    const apiToken = process.env.DATA_API_SECRET; // Using DATA_API_SECRET for Datapacks.shop
     
     if (!networkKey) {
         console.error(`ERROR: Invalid network provided: ${network}`);
         finalStatus = 'pending_review';
     }
-    if (!apiToken || apiToken === 'YOUR_CKAPI_KEY') {
-        console.error("CRITICAL ERROR: CKAPI_API_KEY is missing or invalid in environment variables.");
+    if (!apiToken) {
+        console.error("CRITICAL ERROR: DATA_API_SECRET is missing in environment variables.");
         finalStatus = 'pending_review'; 
     }
-
-    // CKAPI Payload: networkKey, recipient, capacity
+    
     const resellerPayload = {
-        networkKey: networkKey,       
+        network: networkKey,       
+        capacity: dataPlan,          
         recipient: orderDetails.phoneNumber,      
-        capacity: dataPlan, // The capacity is the GB amount ('1', '2', '5', etc.)
+        client_ref: reference      
     };
     
     // --- STEP 2: ATTEMPT DATA TRANSFER ---
     if (finalStatus === 'payment_success') { 
         try {
+            // 🛑 CRITICAL FIX: POST request for order submission to Datapacks.shop
             const transferResponse = await axios.post(
-                resellerApiUrl, 
+                `${resellerApiUrl}?action=order`, 
                 resellerPayload, 
                 {
                     headers: {
-                        'X-API-Key': apiToken, 
+                        'Authorization': `Bearer ${apiToken}`, 
                         'Content-Type': 'application/json'
                     }
                 }
             );
 
             const apiResponseData = transferResponse.data;
+            const firstResult = apiResponseData.results && apiResponseData.results.length > 0 ? apiResponseData.results[0] : null;
 
-            // CKAPI success check based on the PDF documentation example
-            if (apiResponseData.success === true && apiResponseData.data && 
-                (apiResponseData.data.status === 'SUCCESSFUL' || apiResponseData.data.status === 'PROCESSING')) {
+            if (apiResponseData.success === true && firstResult && 
+                (firstResult.status === 'processing' || firstResult.success === true)) {
                 
                 finalStatus = 'data_sent'; 
                 
             } else {
                 console.error("Data API Failed: Could not confirm successful submission.");
                 
-                if (apiResponseData.error) {
-                    console.error('SPECIFIC RESELLER ERROR:', apiResponseData.error); 
+                if (firstResult && firstResult.error) {
+                    console.error('SPECIFIC RESELLER ERROR:', firstResult.error); 
                 }
                 
                 console.error('Full Reseller API Response:', apiResponseData);
@@ -183,10 +181,10 @@ async function executeDataPurchase(userId, orderDetails, paymentMethod) {
     // --- STEP 3: SAVE FINAL ORDER STATUS & ALERT ---
     await Order.create({
         userId: userId,
-        reference: reference, // Our internal reference
+        reference: reference,
         phoneNumber: orderDetails.phoneNumber,
         network: network,
-        dataPlan: orderDetails.dataPlan,
+        dataPlan: dataPlan,
         amount: amount,
         status: finalStatus,
         paymentMethod: paymentMethod
@@ -199,7 +197,7 @@ async function executeDataPurchase(userId, orderDetails, paymentMethod) {
     return { status: finalStatus, reference: reference };
 }
 
-// 🛑 CKAPI LOGIC FOR CRON STATUS CHECK 🛑
+
 async function runPendingOrderCheck() {
     console.log('--- CRON: Checking for pending orders needing status update... ---');
     
@@ -216,40 +214,30 @@ async function runPendingOrderCheck() {
             return;
         }
 
-        const apiToken = process.env.CKAPI_API_KEY;
-        if (!apiToken) {
-             console.error("CRON ERROR: CKAPI_API_KEY is not set. Cannot check status.");
-             return;
-        }
+        const apiToken = process.env.DATA_API_SECRET;
 
         for (const order of pendingOrders) {
             try {
-                // CKAPI Status Check: GET /external/order-status?reference={ref}
-                const statusUrl = `${RESELLER_API_BASE_URL}${STATUS_CHECK_ENDPOINT}`;
-                
-                const statusResponse = await axios.get(statusUrl, {
-                    params: { reference: order.reference },
-                    headers: { 'X-API-Key': apiToken }
+                // DATAPACKS.SHOP STATUS CHECK LOGIC
+                const statusPayload = {
+                    action: 'status', 
+                    ref: order.reference
+                };
+
+                const statusResponse = await axios.get(RESELLER_API_BASE_URL, {
+                    params: statusPayload,
+                    headers: { 'Authorization': `Bearer ${apiToken}` }
                 });
 
                 const apiData = statusResponse.data;
                 
-                // CKAPI returns the status in a nested 'status' field in the root object (not nested in results)
-                if (apiData.success === true && apiData.status) {
-                    const status = apiData.status.toUpperCase();
-                    
-                    if (status === 'SUCCESSFUL') {
-                        await Order.findByIdAndUpdate(order._id, { status: 'data_sent' });
-                        console.log(`CRON SUCCESS: Order ${order.reference} automatically marked 'data_sent'.`);
+                if (apiData.status === 'SUCCESSFUL' || apiData.status === 'DELIVERED') {
+                    await Order.findByIdAndUpdate(order._id, { status: 'data_sent' });
+                    console.log(`CRON SUCCESS: Order ${order.reference} automatically marked 'data_sent'.`);
 
-                    } else if (status === 'FAILED' || status === 'CANCELLED') {
-                        await Order.findByIdAndUpdate(order._id, { status: 'data_failed' });
-                        console.log(`CRON FAILURE: Order ${order.reference} marked 'data_failed'.`);
-                    }
-                    // Keep status as 'pending_review' for PROCESSING or PENDING
-                } else if (apiData.success === false) {
-                    // Log API level error but keep status as 'pending_review' for manual check
-                    console.error(`CRON API ERROR for ${order.reference}: ${apiData.error}`);
+                } else if (apiData.status === 'FAILED' || apiData.status === 'REJECTED') {
+                    await Order.findByIdAndUpdate(order._id, { status: 'data_failed' });
+                    console.log(`CRON FAILURE: Order ${order.reference} marked 'data_failed'.`);
                 }
             } catch (apiError) {
                 if (axios.isAxiosError(apiError)) {
@@ -274,10 +262,26 @@ app.use(session({
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: true, maxAge: 1000 * 60 * 60 } 
+    // 🛑 MongoDB Session Store Configuration
+    store: MongoStore.create({
+        mongoUrl: process.env.MONGODB_URI,
+        collectionName: 'sessions',
+        touchAfter: 24 * 3600 
+    }),
+    cookie: { 
+        secure: true, 
+        maxAge: 1000 * 60 * 60 * 24 
+    } 
 }));
+
 app.use(express.json());
-// Serve the public folder for the React files (index.html, DataResellerApp.jsx)
+
+// --- ADDED HEALTH CHECK ENDPOINT ---
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
+// ------------------------------------
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 
@@ -290,16 +294,7 @@ const isDbReady = (req, res, next) => {
     next();
 };
 
-// Authentication Middleware: Redirects unauthenticated users to the login page
 const isAuthenticated = (req, res, next) => req.session.user ? next() : res.redirect('/login.html');
-// --- ADD THIS SIMPLE HEALTH CHECK ENDPOINT ---
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok', uptime: process.uptime() });
-});
-// ---------------------------------------------
-
-// The rest of your routes follow...
-
 
 // --- USER AUTHENTICATION & INFO ROUTES ---
 app.post('/api/signup', isDbReady, async (req, res) => {
@@ -308,9 +303,10 @@ app.post('/api/signup', isDbReady, async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         
+        // Default role is 'Client'
         await User.create({ username, email, password: hashedPassword, walletBalance: 0, role: 'Client' }); 
         
-        res.status(201).json({ message: 'Client account created successfully! Please log in.' });
+        res.status(201).json({ message: 'Account created successfully! Please log in.' });
     } catch (error) { 
         if (error.code === 11000) return res.status(400).json({ message: 'Username or email already exists.' });
         res.status(500).json({ message: 'Server error during signup.' }); 
@@ -327,7 +323,7 @@ app.post('/api/login', isDbReady, async (req, res) => {
         }
         
         if (!user.role) {
-            user.role = 'Client'; // Default to client if role is missing
+            user.role = 'Client';
             await User.findByIdAndUpdate(user._id, { role: 'Client' });
         }
         
@@ -335,7 +331,7 @@ app.post('/api/login', isDbReady, async (req, res) => {
         
         req.session.user = { id: user._id, username: freshUser.username, walletBalance: freshUser.walletBalance, role: freshUser.role }; 
         
-        const redirectUrl = '/'; // Redirect to the main React app route
+        const redirectUrl = '/purchase.html'; 
         
         res.json({ message: 'Logged in successfully!', redirect: redirectUrl });
         
@@ -362,7 +358,127 @@ app.get('/api/user-info', isDbReady, isAuthenticated, async (req, res) => {
     }
 });
 
-// Simplified endpoints for the new React app
+app.post('/api/forgot-password', isDbReady, async (req, res) => {
+    const { email } = req.body;
+    try {
+        const user = await User.findOne({ email });
+        if (!user) {
+            return res.status(404).json({ message: 'If the email exists, a password reset link has been sent.' });
+        }
+        
+        const resetToken = crypto.randomBytes(20).toString('hex');
+        
+        user.resetToken = resetToken;
+        user.resetTokenExpires = Date.now() + 3600000; // 1 hour
+        await user.save();
+        
+        res.json({ message: 'A password reset link has been sent to your email.' });
+        
+    } catch (error) {
+        res.status(500).json({ message: 'Server error while processing request.' });
+    }
+});
+
+app.post('/api/reset-password', isDbReady, async (req, res) => {
+    const { token, newPassword } = req.body;
+    try {
+        const user = await User.findOne({
+            resetToken: token,
+            resetTokenExpires: { $gt: Date.now() } 
+        });
+
+        if (!user) {
+            return res.status(400).json({ message: 'Invalid or expired token.' });
+        }
+        
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        
+        user.password = hashedPassword;
+        user.resetToken = undefined;
+        user.resetTokenExpires = undefined;
+        await user.save();
+
+        res.json({ message: 'Password updated successfully. Please log in.' });
+
+    } catch (error) {
+        res.status(500).json({ message: 'Server error while resetting password.' });
+    }
+});
+
+app.post('/api/agent-signup', isDbReady, async (req, res) => {
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) return res.status(400).json({ message: 'All fields are required.' });
+    
+    const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+    if (existingUser) {
+        return res.status(400).json({ message: 'User already exists.' });
+    }
+
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        
+        const finalRegistrationCharge = calculateClientTopupFee(AGENT_REGISTRATION_FEE_PESEWAS);
+        
+        const tempUser = await User.create({ 
+            username, 
+            email, 
+            password: hashedPassword, 
+            walletBalance: 0, 
+            role: 'Agent_Pending' 
+        });
+
+        res.status(200).json({ 
+            message: 'Initiate payment for registration.',
+            userId: tempUser._id,
+            amountPesewas: finalRegistrationCharge 
+        });
+
+    } catch (error) {
+        console.error('Agent signup initiation error:', error);
+        res.status(500).json({ message: 'Server error during agent signup initiation.' }); 
+    }
+});
+
+app.post('/api/verify-agent-payment', async (req, res) => {
+    const { reference, userId } = req.body;
+    
+    const expectedCharge = calculateClientTopupFee(AGENT_REGISTRATION_FEE_PESEWAS);
+
+    try {
+        const paystackUrl = `https://api.paystack.co/transaction/verify/${reference}`;
+        const paystackResponse = await axios.get(paystackUrl, { 
+            headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } 
+        });
+        const { status, data } = paystackResponse.data;
+        
+        const acceptableMinimum = Math.floor(expectedCharge * 0.95);
+        const acceptableMaximum = Math.ceil(expectedCharge * 1.05);
+        
+        if (data.status === 'success' && data.amount >= acceptableMinimum && data.amount <= acceptableMaximum) {
+            
+            const user = await User.findByIdAndUpdate(
+                userId, 
+                { role: 'Agent' }, 
+                { new: true }
+            );
+
+            if (user) {
+                return res.json({ message: 'Registration successful! You are now an Agent.', role: 'Agent' });
+            }
+        }
+        
+        res.status(400).json({ message: 'Payment verification failed. Please try again.' });
+
+    } catch (error) {
+        console.error('Agent payment verification error:', error);
+        await User.findByIdAndDelete(userId);
+        res.status(500).json({ message: 'Verification failed. Contact support.' });
+    }
+});
+
+
+// --- DATA & PROTECTED PAGES ---
+
 app.get('/api/data-plans', isDbReady, async (req, res) => { 
     const costPlans = allPlans[req.query.network] || [];
     
@@ -422,7 +538,7 @@ app.post('/api/topup', isDbReady, isAuthenticated, async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'The transaction reference provided is invalid or associated with a failed payment.' });
         }
 
-        // Use a flexible 5% range check for the verified amount
+        // --- STEP 2: FLEXIBLE AMOUNT CHECK ---
         const acceptableMinimum = Math.floor(finalChargedAmountPesewas * 0.95); 
         const acceptableMaximum = Math.ceil(finalChargedAmountPesewas * 1.05);
 
@@ -431,10 +547,10 @@ app.post('/api/topup', isDbReady, isAuthenticated, async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Amount charged mismatch detected. Please contact support immediately.' });
         }
         
-        // --- STEP 2: UPDATE USER WALLET BALANCE (NET DEPOSIT) ---
+        // --- STEP 3: UPDATE USER WALLET BALANCE (NET DEPOSIT) ---
         const updatedUser = await User.findByIdAndUpdate(
             userId,
-            { $inc: { walletBalance: topupAmountPesewas } },
+            { $inc: { walletBalance: topupAmountPesewas } }, 
             { new: true, runValidators: true }
         );
         
@@ -471,10 +587,12 @@ app.post('/api/wallet-purchase', isDbReady, isAuthenticated, async (req, res) =>
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
+        // 1. Check Balance
         if (user.walletBalance < amountInPesewas) {
             return res.status(400).json({ message: 'Insufficient wallet balance.' });
         }
 
+        // 2. Debit Wallet (Atomically)
         const debitResult = await User.findByIdAndUpdate(
             userId,
             { $inc: { walletBalance: -amountInPesewas } },
@@ -483,6 +601,7 @@ app.post('/api/wallet-purchase', isDbReady, isAuthenticated, async (req, res) =>
         
         req.session.user.walletBalance = debitResult.walletBalance;
 
+        // 3. Execute Data Purchase
         const result = await executeDataPurchase(userId, {
             network,
             dataPlan,
@@ -505,11 +624,218 @@ app.post('/api/wallet-purchase', isDbReady, isAuthenticated, async (req, res) =>
     }
 });
 
+app.post('/paystack/verify', isDbReady, isAuthenticated, async (req, res) => {
+    const { reference } = req.body;
+    if (!reference) return res.status(400).json({ status: 'error', message: 'Reference is required.' });
 
-// Serve the React App - index.html handles the routing now
+    let orderDetails = null; 
+    
+    try {
+        // --- STEP 1: VERIFY PAYMENT WITH PAYSTACK ---
+        const paystackUrl = `https://api.paystack.co/transaction/verify/${reference}`;
+        const paystackResponse = await axios.get(paystackUrl, { 
+            headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } 
+        });
+        const { status, data } = paystackResponse.data;
+
+        if (!status || data.status !== 'success') {
+            return res.status(400).json({ status: 'error', message: 'Payment verification failed.' });
+        }
+
+        const { phone_number, network, data_plan } = data.metadata; 
+        const amountInGHS = data.amount / 100;
+        const userId = req.session.user.id;
+        
+        orderDetails = {
+            userId: userId,
+            reference: reference,
+            phoneNumber: phone_number,
+            network: network,
+            dataPlan: data_plan,
+            amount: amountInGHS,
+            status: 'payment_success'
+        };
+        
+        // Execute the data transfer and save order 
+        const result = await executeDataPurchase(userId, orderDetails, 'paystack');
+
+        if (result.status === 'data_sent') {
+            return res.json({ status: 'success', message: `Payment verified. Data transfer successful!` });
+        } else {
+            return res.status(202).json({ 
+                status: 'pending', 
+                message: `Payment successful! Data transfer is pending manual review. Contact support with reference: ${reference}.` 
+            });
+        }
+
+    } catch (error) {
+        let errorMessage = 'An internal server error occurred during verification.';
+        
+        if (error.response && error.response.data && error.response.data.error) {
+            errorMessage = `External API Error: ${error.response.data.error}`;
+        } else if (error.message) {
+            errorMessage = `Network Error: ${error.message}`;
+            
+            console.error('Fatal Verification Failure:', error); 
+        }
+        
+        return res.status(500).json({ status: 'error', message: errorMessage });
+    }
+});
+
+
+// --- ADMIN & MANAGEMENT ROUTES ---
+// 🛑 NEW: Endpoint to fetch all users and their session status
+app.get('/api/admin/all-users-status', async (req, res) => {
+    if (req.query.secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized" });
+    
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Database not ready.' });
+
+        const registeredUsers = await User.find({}).select('username email createdAt role').lean();
+
+        const sessionsCollection = mongoose.connection.db.collection('sessions');
+        const rawSessions = await sessionsCollection.find({}).toArray();
+
+        const activeUserIds = new Set();
+        rawSessions.forEach(sessionDoc => {
+            try {
+                const sessionData = JSON.parse(sessionDoc.session);
+                if (sessionData.user && sessionData.user.id) {
+                    let sessionId = sessionData.user.id.toString().replace(/['"]+/g, '');
+                    activeUserIds.add(sessionId);
+                }
+            } catch (e) { 
+                console.warn("Failed to parse session data:", e.message);
+            }
+        });
+
+        const userListWithStatus = registeredUsers.map(user => ({
+            username: user.username,
+            email: user.email,
+            signedUp: user.createdAt,
+            isOnline: activeUserIds.has(user._id.toString()),
+            role: user.role
+        }));
+
+        res.json({ users: userListWithStatus });
+    } catch (error) {
+        console.error('All users status error:', error);
+        res.status(500).json({ error: 'Failed to fetch user list and status' });
+    }
+});
+
+app.get('/api/get-all-orders', async (req, res) => {
+    if (req.query.secret !== process.env.ADMIN_SECRET) {
+        console.error(`ADMIN ERROR: Failed attempt to fetch orders. Client secret (last 4 chars): [${req.query.secret.slice(-4)}]`);
+        return res.status(403).json({ error: "Unauthorized: Invalid Admin Secret" });
+    }
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            return res.status(503).json({ error: 'Database not ready for admin query.' });
+        }
+        
+        const orders = await Order.find({})
+                                  .sort({ createdAt: -1 })
+                                  .populate('userId', 'username'); 
+        
+        const formattedOrders = orders.map(order => ({
+            id: order._id,
+            username: order.userId ? order.userId.username : 'Deleted User',
+            phone_number: order.phoneNumber || 'N/A', 
+            network: order.network || 'WALLET', 
+            dataPlan: order.dataPlan,
+            amount: order.amount,
+            status: order.status,
+            created_at: order.createdAt,
+        }));
+
+        res.json({ orders: formattedOrders });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch orders" });
+    }
+});
+
+app.get('/api/admin/user-count', async (req, res) => {
+    if (req.query.secret !== process.env.ADMIN_SECRET) {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Database not ready.' });
+
+        const count = await User.countDocuments({});
+        res.json({ count: count });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch user count' });
+    }
+});
+
+app.post('/api/admin/update-order', async (req, res) => {
+    if (req.body.adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Unauthorized access.' });
+    const { orderId, newStatus } = req.body;
+    
+    if (!orderId || !newStatus) return res.status(400).json({ error: 'Order ID and new status are required.' });
+
+    try {
+        const result = await Order.findByIdAndUpdate(orderId, { status: newStatus }, { new: true });
+        if (!result) return res.status(404).json({ message: 'Order not found.' });
+        
+        res.json({ status: 'success', message: `Order ${orderId} status updated to ${newStatus}.` });
+
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to update order status.' });
+    }
+});
+
+app.get('/api/admin/metrics', async (req, res) => {
+    if (req.query.secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+
+    try {
+        if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Database not ready.' });
+
+        const successfulOrders = await Order.find({ status: 'data_sent' });
+        
+        let totalRevenueGHS = 0;
+        let totalCostGHS = 0;
+        let totalPaystackFeeGHS = 0;
+
+        successfulOrders.forEach(order => {
+            const chargedAmountInPesewas = Math.round(order.amount * 100);
+            
+            const resellerCostInPesewas = findBaseCost(order.network, order.dataPlan);
+            const paystackFeeInPesewas = calculatePaystackFee(chargedAmountInPesewas);
+            
+            totalRevenueGHS += order.amount; 
+            totalPaystackFeeGHS += (paystackFeeInPesewas / 100);
+            totalCostGHS += (resellerCostInPesewas / 100); 
+        });
+        
+        const totalNetCostGHS = totalCostGHS + totalPaystackFeeGHS;
+        const totalNetProfitGHS = totalRevenueGHS - totalNetCostGHS;
+
+        res.json({
+            revenue: totalRevenueGHS.toFixed(2),
+            cost: totalCostGHS.toFixed(2),
+            paystackFee: totalPaystackFeeGHS.toFixed(2),
+            netProfit: totalNetProfitGHS.toFixed(2),
+            totalOrders: successfulOrders.length
+        });
+
+    } catch (error) {
+        console.error('Metrics error:', error);
+        res.status(500).json({ error: 'Failed to calculate metrics' });
+    }
+});
+
+
+// --- SERVE HTML FILES ---
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-app.get('/login.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 app.get('/signup.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'signup.html')));
+app.get('/purchase.html', isAuthenticated, (req, res) => res.sendFile(path.join(__dirname, 'public', 'purchase.html')));
+app.get('/dashboard.html', isAuthenticated, (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
+app.get('/admin.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
+app.get('/forgot.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'forgot.html')));
+app.get('/reset.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'reset.html')));
 
 
 // --- SERVER START ---
@@ -517,6 +843,5 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is LIVE on port ${PORT}`);
     console.log('Database connection is initializing...');
     
-    cron.schedule('*/5 * * * *', runPendingOrderCheck); 
-
+    cron.schedule('*/5 * * * *', runPendingOrderCheck); // Runs every 5 minutes
 });
